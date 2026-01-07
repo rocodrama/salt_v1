@@ -1,0 +1,10 @@
+Pillow
+numpy
+opencv-python
+
+mediapipe
+
+diffusers 
+transformers 
+accelerate 
+safetensors 
