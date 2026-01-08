@@ -1,0 +1,93 @@
+import argparse
+import os
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from torchvision.utils import save_image
+
+from diffusers import AutoencoderKL, UNet2DModel, DDPMScheduler
+
+
+def soften_mask(mask01, ksize=11):
+    if ksize % 2 == 0:
+        ksize += 1
+    mask = cv2.GaussianBlur(mask01.astype(np.float32), (ksize, ksize), 0)
+    return np.clip(mask, 0.0, 1.0)
+
+
+@torch.no_grad()
+def sample_hair(unet, vae, device, steps, seed):
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+
+    scheduler = DDPMScheduler(num_train_timesteps=1000)
+    scheduler.set_timesteps(steps)
+
+    latents = torch.randn((1, 4, 32, 32), device=device, generator=g)
+
+    for t in scheduler.timesteps:
+        noise_pred = unet(latents, t).sample
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+    latents = latents / 0.18215
+    img = vae.decode(latents).sample
+    img = (img.clamp(-1, 1) + 1) * 0.5  # [0,1]
+    return img[0]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mask", required=True, help="mask folder (0/1 or 0/255)")
+    ap.add_argument("--ckpt", required=True, help="UNet checkpoint folder")
+    ap.add_argument("--out", required=True, help="output folder")
+    ap.add_argument("--steps", type=int, default=50)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--blur", type=int, default=11)
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(args.out, exist_ok=True)
+
+    # load models
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device).eval()
+    unet = UNet2DModel.from_pretrained(args.ckpt).to(device).eval()
+
+    scalp_rgb = np.array([229, 212, 195], np.float32)
+
+    mask_dir = Path(args.mask)
+
+    for mask_path in mask_dir.iterdir():
+        if not mask_path.is_file():
+            continue
+
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        mask01 = (mask > 0).astype(np.float32)
+        mask01 = soften_mask(mask01, args.blur)
+
+        # 1) generate hair
+        hair = sample_hair(
+            unet=unet,
+            vae=vae,
+            device=device,
+            steps=args.steps,
+            seed=args.seed,
+        )
+        hair = (hair.permute(1, 2, 0).cpu().numpy() * 255).astype(np.float32)
+
+        # 2) compose
+        mask3 = mask01[..., None]
+        scalp = np.zeros_like(hair)
+        scalp[:] = scalp_rgb
+
+        out = scalp * mask3 + hair * (1.0 - mask3)
+        out = out.astype(np.uint8)
+
+        cv2.imwrite(str(Path(args.out) / mask_path.name), out)
+
+    print("[DONE]")
+
+
+if __name__ == "__main__":
+    main()
