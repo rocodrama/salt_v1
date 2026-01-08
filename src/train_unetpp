@@ -1,0 +1,338 @@
+# src/train_unetpp.py
+import argparse
+import os
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def set_device(gpu_arg: str) -> str:
+    if gpu_arg.lower() == "cpu":
+        return "cpu"
+    if torch.cuda.is_available():
+        try:
+            idx = int(gpu_arg)
+            torch.cuda.set_device(idx)
+            return f"cuda:{idx}"
+        except Exception:
+            return "cuda"
+    return "cpu"
+
+
+def find_by_stem(folder: Path, stem: str):
+    # exact stem + known ext
+    for ext in IMG_EXTS:
+        p = folder / f"{stem}{ext}"
+        if p.exists():
+            return p
+    # fallback
+    for p in folder.glob(f"{stem}.*"):
+        if p.suffix.lower() in IMG_EXTS:
+            return p
+    return None
+
+
+class SegPairDataset(Dataset):
+    """
+    Expects:
+      root/images/*
+      root/masks/*
+    Match by stem.
+    """
+    def __init__(self, root: str, size=256):
+        self.root = Path(root)
+        self.img_dir = self.root / "images"
+        self.msk_dir = self.root / "masks"
+        self.size = int(size)
+
+        if not self.img_dir.exists():
+            raise FileNotFoundError(f"images folder not found: {self.img_dir}")
+        if not self.msk_dir.exists():
+            raise FileNotFoundError(f"masks folder not found: {self.msk_dir}")
+
+        img_paths = [p for p in self.img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS]
+        img_paths.sort()
+
+        pairs = []
+        for ip in img_paths:
+            mp = find_by_stem(self.msk_dir, ip.stem)
+            if mp is not None:
+                pairs.append((ip, mp))
+
+        self.pairs = pairs
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        ip, mp = self.pairs[idx]
+
+        img = cv2.imread(str(ip), cv2.IMREAD_COLOR)  # BGR
+        if img is None:
+            raise RuntimeError(f"Cannot read image: {ip}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        msk = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+        if msk is None:
+            raise RuntimeError(f"Cannot read mask: {mp}")
+
+        # resize
+        img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        msk = cv2.resize(msk, (self.size, self.size), interpolation=cv2.INTER_NEAREST)
+
+        # to float
+        img = img.astype(np.float32) / 255.0
+        img = (img - 0.5) / 0.5  # [-1,1]
+        img = np.transpose(img, (2, 0, 1))  # CHW
+
+        # mask to {0,1}
+        msk = (msk > 0).astype(np.float32)  # HW
+        msk = msk[None, ...]  # 1HW
+
+        return torch.from_numpy(img), torch.from_numpy(msk)
+
+
+# ---------- UNet++ (Nested U-Net) ----------
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UNetPP(nn.Module):
+    """
+    UNet++ with deep supervision optional.
+    This implementation outputs a single final logit map (B,1,H,W).
+    """
+    def __init__(self, in_channels=3, base=32, num_classes=1):
+        super().__init__()
+        nb = base
+        self.pool = nn.MaxPool2d(2, 2)
+
+        # encoder convs
+        self.conv0_0 = ConvBNReLU(in_channels, nb)
+        self.conv1_0 = ConvBNReLU(nb, nb * 2)
+        self.conv2_0 = ConvBNReLU(nb * 2, nb * 4)
+        self.conv3_0 = ConvBNReLU(nb * 4, nb * 8)
+        self.conv4_0 = ConvBNReLU(nb * 8, nb * 16)
+
+        # upsample
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+
+        # decoder (nested)
+        self.conv0_1 = ConvBNReLU(nb + nb * 2, nb)
+        self.conv1_1 = ConvBNReLU(nb * 2 + nb * 4, nb * 2)
+        self.conv2_1 = ConvBNReLU(nb * 4 + nb * 8, nb * 4)
+        self.conv3_1 = ConvBNReLU(nb * 8 + nb * 16, nb * 8)
+
+        self.conv0_2 = ConvBNReLU(nb * 2 + nb * 2, nb)
+        self.conv1_2 = ConvBNReLU(nb * 4 + nb * 4, nb * 2)
+        self.conv2_2 = ConvBNReLU(nb * 8 + nb * 8, nb * 4)
+
+        self.conv0_3 = ConvBNReLU(nb * 3 + nb * 2, nb)
+        self.conv1_3 = ConvBNReLU(nb * 6 + nb * 4, nb * 2)
+
+        self.conv0_4 = ConvBNReLU(nb * 4 + nb * 2, nb)
+
+        self.final = nn.Conv2d(nb, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.pool(x0_0))
+        x2_0 = self.conv2_0(self.pool(x1_0))
+        x3_0 = self.conv3_0(self.pool(x2_0))
+        x4_0 = self.conv4_0(self.pool(x3_0))
+
+        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
+        x3_1 = self.conv3_1(torch.cat([x3_0, self.up(x4_0)], 1))
+
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
+        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.up(x3_1)], 1))
+
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
+        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.up(x2_2)], 1))
+
+        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.up(x1_3)], 1))
+
+        logits = self.final(x0_4)
+        return logits
+
+
+# ---------- losses / metrics ----------
+def dice_loss_with_logits(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    num = 2.0 * (probs * targets).sum(dim=(2, 3))
+    den = (probs + targets).sum(dim=(2, 3)) + eps
+    dice = num / den
+    return 1.0 - dice.mean()
+
+
+@torch.no_grad()
+def iou_score_from_logits(logits, targets, thresh=0.5, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    preds = (probs >= thresh).float()
+    inter = (preds * targets).sum(dim=(2, 3))
+    union = (preds + targets - preds * targets).sum(dim=(2, 3)) + eps
+    iou = inter / union
+    return float(iou.mean().item())
+
+
+def save_ckpt(model, out_dir: Path, tag: str):
+    d = out_dir / tag
+    d.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), d / "model.pt")
+    print(f"[SAVE] {d}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train", required=True, help="train folder (contains images/, masks/)")
+    ap.add_argument("--val", required=True, help="val folder (contains images/, masks/)")
+    ap.add_argument("--out", default="unetpp_ckpt", help="output folder")
+    ap.add_argument("--epoch", type=int, default=50)
+    ap.add_argument("--save_epoch", type=int, default=5)
+    ap.add_argument("--gpu", default="0", help='GPU index like "0" or "cpu"')
+
+    ap.add_argument("--size", type=int, default=256)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--base", type=int, default=32, help="UNet++ base channels (default: 32)")
+    ap.add_argument("--bce", type=float, default=1.0, help="BCE weight")
+    ap.add_argument("--dice", type=float, default=1.0, help="Dice weight")
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    device = set_device(args.gpu)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ds_tr = SegPairDataset(args.train, size=args.size)
+    ds_va = SegPairDataset(args.val, size=args.size)
+    if len(ds_tr) == 0:
+        print("[ERROR] No matched train (image,mask) pairs found.")
+        return
+    if len(ds_va) == 0:
+        print("[ERROR] No matched val (image,mask) pairs found.")
+        return
+
+    dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True,
+                       num_workers=args.num_workers, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=args.batch, shuffle=False,
+                       num_workers=args.num_workers, drop_last=False)
+
+    print(f"[INFO] device={device}")
+    print(f"[INFO] train_pairs={len(ds_tr)} val_pairs={len(ds_va)}")
+    print(f"[INFO] epoch={args.epoch} batch={args.batch} lr={args.lr} size={args.size}")
+
+    model = UNetPP(in_channels=3, base=args.base, num_classes=1).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    bce_fn = nn.BCEWithLogitsLoss()
+
+    best_val = 1e18
+    best_iou = -1.0
+
+    for ep in range(1, args.epoch + 1):
+        # ---- train ----
+        model.train()
+        tr_loss_sum = 0.0
+        tr_n = 0
+
+        for it, (x, y) in enumerate(dl_tr, 1):
+            x = x.to(device)
+            y = y.to(device)
+
+            logits = model(x)
+            loss_bce = bce_fn(logits, y)
+            loss_dice = dice_loss_with_logits(logits, y)
+            loss = args.bce * loss_bce + args.dice * loss_dice
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            tr_loss_sum += float(loss.item())
+            tr_n += 1
+
+            if it % 50 == 0:
+                print(f"[TRAIN] epoch={ep} iter={it}/{len(dl_tr)} loss={loss.item():.6f}")
+
+        tr_loss = tr_loss_sum / max(1, tr_n)
+
+        # ---- val ----
+        model.eval()
+        va_loss_sum = 0.0
+        va_n = 0
+        va_iou_sum = 0.0
+        va_iou_n = 0
+
+        with torch.no_grad():
+            for it, (x, y) in enumerate(dl_va, 1):
+                x = x.to(device)
+                y = y.to(device)
+
+                logits = model(x)
+                loss_bce = bce_fn(logits, y)
+                loss_dice = dice_loss_with_logits(logits, y)
+                loss = args.bce * loss_bce + args.dice * loss_dice
+
+                va_loss_sum += float(loss.item())
+                va_n += 1
+
+                va_iou_sum += iou_score_from_logits(logits, y)
+                va_iou_n += 1
+
+                if it % 50 == 0:
+                    print(f"[VAL]   epoch={ep} iter={it}/{len(dl_va)} loss={loss.item():.6f}")
+
+        va_loss = va_loss_sum / max(1, va_n)
+        va_iou = va_iou_sum / max(1, va_iou_n)
+
+        print(f"[EPOCH {ep}] train_loss={tr_loss:.6f}  val_loss={va_loss:.6f}  val_IoU={va_iou:.4f}")
+
+        # best by val_loss
+        if va_loss < best_val:
+            best_val = va_loss
+            save_ckpt(model, out_dir, "best")
+            print(f"[BEST] val_loss improved -> {best_val:.6f}")
+
+        # also track best IoU (optional, just print)
+        if va_iou > best_iou:
+            best_iou = va_iou
+            print(f"[BEST_IOU] improved -> {best_iou:.4f}")
+
+        if args.save_epoch > 0 and ep % args.save_epoch == 0:
+            save_ckpt(model, out_dir, f"epoch_{ep}")
+
+    save_ckpt(model, out_dir, "final")
+    print("[DONE]")
+
+
+if __name__ == "__main__":
+    main()
